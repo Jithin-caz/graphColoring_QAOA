@@ -54,12 +54,14 @@ warnings.filterwarnings("ignore")
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION II-A  Color coding
 # ═══════════════════════════════════════════════════════════════════════════════
+
 def get_brooks_bound(subgraph: nx.Graph) -> int:
-    """Brooks' Theorem: k <= Δ + 1"""
-    if subgraph.number_of_nodes() == 0: return 2
+    """Brooks' Theorem: χ(G) ≤ Δ + 1"""
+    if subgraph.number_of_nodes() == 0:
+        return 2
     delta = max(dict(subgraph.degree()).values())
-    # Standard Brooks bound logic
     return delta + 1
+
 
 def num_qubits_per_node(k: int) -> int:
     """
@@ -206,7 +208,7 @@ def build_hamiltonian(subgraph: nx.Graph,
     # ── H_edge  Eq.(10) ───────────────────────────────────────────────────────
     for (u, v) in subgraph.edges():
         iu, iv = node_idx[u], node_idx[v]
-        H.constant += lambda_edge * m          # +m per edge term
+        H.constant += lambda_edge * m           # +m per edge term
         for i in range(m):
             qu = iu * m + i
             qv = iv * m + i
@@ -219,11 +221,11 @@ def build_hamiltonian(subgraph: nx.Graph,
         iv = node_idx[v]
         # LSB-first binary encoding of target color
         bits_b = [(target_c >> i) & 1 for i in range(m)]
-        H.constant += lambda_fix * m            # +m per fixed node
+        H.constant += lambda_fix * m             # +m per fixed node
         for i in range(m):
-            sign = 2 * bits_b[i] - 1            # +1 if b=1, -1 if b=0
+            sign = 2 * bits_b[i] - 1             # +1 if b=1, -1 if b=0
             q = iv * m + i
-            H.add_single(lambda_fix * sign, q)  # (2b_i-1)·Z_{u,i}
+            H.add_single(lambda_fix * sign, q)   # (2b_i-1)·Z_{u,i}
 
     return H, n_qubits, nodes
 
@@ -243,12 +245,8 @@ def build_qaoa_circuit(H: ProblemHamiltonian,
     |ψ_0⟩ = |+⟩^⊗N   (Hadamard on all qubits)
     H_M = Σ_{v,i} X_{v,i}   (transverse mixer)
 
-    U_C(γ_l):
-      single Z term  →  RZ(2γ·coeff)
-      ZZ term        →  CX · RZ(2γ·coeff) · CX
-
-    U_B(β_l):
-      RX(2β) on every qubit
+    U_C(γ_l):  single Z → RZ(2γ·coeff),  ZZ → CX·RZ(2γ·coeff)·CX
+    U_B(β_l):  RX(2β) on every qubit
     """
     gamma = ParameterVector("γ", p)
     beta  = ParameterVector("β", p)
@@ -280,13 +278,11 @@ def expectation_value(counts: Dict[int, float],
                       n_qubits: int) -> float:
     """
     Paper Eq.(13): ℓ(θ) = Σ_s P(s)·E(s)
-
-    For bitstring s, Z_i eigenvalue = 1-2·s_i (+1 for |0⟩, -1 for |1⟩).
+    Z_i eigenvalue = 1 - 2·s_i  (+1 for |0⟩, -1 for |1⟩).
     """
     total_e = 0.0
     total_p = 0.0
     for state_int, prob in counts.items():
-        # Qiskit: bit q is at position q of state_int
         z = [1 - 2 * ((state_int >> q) & 1) for q in range(n_qubits)]
         e = H.constant
         for coeff, q in H.single:
@@ -318,12 +314,11 @@ def solve_k_coloring_qaoa(subgraph: nx.Graph,
     (a) Qubit allocation: N_total = |V|·m; skip if > Q_available
     (b) Construct H_C (Eq.12)
     (c) Initialise |ψ_0⟩ = |+⟩^⊗N; build p-layer QAOA ansatz
-    (d) Gradient updates θ_{t+1} = θ_t - η·∇_θ ℓ(θ);
-        early stop if no improvement in 3 steps OR conflict_edges=0
+    (d) COBYLA optimisation with early stop:
+          - no improvement for 3 consecutive steps, OR
+          - current coloring has 0 conflict edges
     (e) Measure; c_v = (Σ 2^i·s_{v,i}) mod k
-    (f) Verify Eq.(8); return (k*, C) if valid
-
-    Returns coloring {node: color} or None if skipped.
+    (f) Return coloring (validity checked by caller)
     """
     nodes = list(subgraph.nodes())
     m = num_qubits_per_node(k)
@@ -344,7 +339,7 @@ def solve_k_coloring_qaoa(subgraph: nx.Graph,
     qc = build_qaoa_circuit(H, n_qubits, p)
     sampler = Sampler()
 
-    # Step (d): COBYLA optimisation with early stopping
+    # Step (d)
     n_params = 2 * p
     theta0 = np.random.uniform(0.0, np.pi, n_params)
     best_theta = theta0.copy()
@@ -352,10 +347,8 @@ def solve_k_coloring_qaoa(subgraph: nx.Graph,
     no_improve_streak = [0]
 
     def objective(th: np.ndarray) -> float:
-        gv = th[:p]
-        bv = th[p:]
-        pd = {f"γ[{i}]": gv[i] for i in range(p)}
-        pd.update({f"β[{i}]": bv[i] for i in range(p)})
+        pd = {f"γ[{i}]": th[i] for i in range(p)}
+        pd.update({f"β[{i}]": th[p + i] for i in range(p)})
 
         bound = qc.assign_parameters(pd)
         result = sampler.run([bound], shots=shots).result()
@@ -367,11 +360,9 @@ def solve_k_coloring_qaoa(subgraph: nx.Graph,
         else:
             no_improve_streak[0] += 1
 
-        # Early stop: no improvement for 3 steps
         if no_improve_streak[0] >= max_no_improve:
             raise StopIteration("early_stop")
 
-        # Early stop: current best has 0 conflicts
         col_tmp = _decode_coloring(result.quasi_dists[0], n_qubits,
                                    ordered_nodes, m, k)
         if count_edge_conflicts(subgraph, col_tmp) == 0:
@@ -387,17 +378,13 @@ def solve_k_coloring_qaoa(subgraph: nx.Graph,
     except StopIteration:
         pass
 
-    # Step (e): final sampling with optimal parameters
-    gv = best_theta[:p]
-    bv = best_theta[p:]
-    pd = {f"γ[{i}]": gv[i] for i in range(p)}
-    pd.update({f"β[{i}]": bv[i] for i in range(p)})
+    # Step (e): final sampling
+    pd = {f"γ[{i}]": best_theta[i] for i in range(p)}
+    pd.update({f"β[{i}]": best_theta[p + i] for i in range(p)})
     bound = qc.assign_parameters(pd)
     final_counts = sampler.run([bound], shots=shots * 4).result().quasi_dists[0]
 
-    # Pick highest-probability bitstring
-    coloring = _decode_coloring(final_counts, n_qubits, ordered_nodes, m, k)
-    return coloring
+    return _decode_coloring(final_counts, n_qubits, ordered_nodes, m, k)
 
 
 def _decode_coloring(counts: Dict[int, float],
@@ -425,32 +412,30 @@ def louvain_partition(graph: nx.Graph,
                       Q_available: int) -> Dict[int, List[int]]:
     """
     Paper Section III (a):
-    - Louvain algorithm for balanced community detection (modularity)
-    - n_s = max(2, ⌈√N⌉) target subgraph count
-    - Degree-centrality: high-degree nodes placed interior of subgraph
-    - Subgraphs sorted by size descending (subgraph 1 = largest)
-    - Recursively split communities exceeding Eq.(1) limit
+    - Louvain modularity-based community detection
+    - n_s = max(2, ⌈√N⌉)
+    - Degree-centrality ordering within each community
+    - Subgraphs sorted by size descending
+    - Recursive splitting for communities exceeding Eq.(1) limit
     """
     N = graph.number_of_nodes()
     v_max = max_subgraph_vertices(Q_available, k)
-    n_s = max(2, math.ceil(math.sqrt(N)))  # paper: n_s = max(2, √N)
 
     if N == 0:
         return {}
 
     partition: Dict[int, int] = community_louvain.best_partition(graph)
 
-    # Invert partition
     raw: Dict[int, List[int]] = defaultdict(list)
     for node, cid in partition.items():
         raw[cid].append(node)
 
-    # Sort nodes within each community by degree desc (degree centrality)
+    # Sort nodes within each community by degree descending
     deg = dict(graph.degree())
     for cid in raw:
         raw[cid].sort(key=lambda v: deg[v], reverse=True)
 
-    # Sort communities by size desc ("subgraph 1 contains the largest")
+    # Sort communities by size descending
     sorted_comms = sorted(raw.values(), key=len, reverse=True)
 
     # Recursively split oversized communities
@@ -479,10 +464,9 @@ def build_interaction_graph(graph: nx.Graph,
                              ) -> Tuple[nx.Graph, Dict[int, int]]:
     """
     Paper Section III step (2):
-    - Collapse each community to a supernode
-    - Add edge between supernodes if any cross-community edge exists
-    - Apply classical greedy algorithm to color the interaction graph
-    Returns (interaction_graph, inter_coloring {cid -> color}).
+    - Each community → supernode
+    - Supernode edge if any cross-community edge exists
+    - Greedy classical coloring of interaction graph (backbone)
     """
     node_to_cid = {n: cid for cid, nodes in communities.items() for n in nodes}
 
@@ -493,7 +477,6 @@ def build_interaction_graph(graph: nx.Graph,
         if cu is not None and cv is not None and cu != cv:
             ig.add_edge(cu, cv)
 
-    # Classical greedy coloring of interaction graph (step 2 in Fig.1)
     inter_coloring: Dict[int, int] = nx.coloring.greedy_color(
         ig, strategy="largest_first"
     )
@@ -501,7 +484,7 @@ def build_interaction_graph(graph: nx.Graph,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SECTION III  (3)  Feedback correction  (with Eq.5 isomorphism reuse)
+# SECTION III  (3)  Feedback correction  (Eq.5 isomorphism reuse)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def feedback_correction(graph: nx.Graph,
@@ -517,26 +500,18 @@ def feedback_correction(graph: nx.Graph,
                         max_iter: int = 5,
                         ) -> Dict[int, Dict[int, int]]:
     """
-    Paper Section III step (3) / Fig.1(c):
-    Fix interaction-graph coloring and feed back to re-run QAOA on
-    conflicting subgraphs.
-
-    Includes:
-    - Cache for intermediate subgraph results
-    - Isomorphic subgraph detection (Eq.5): reuse coloring via φ mapping
-    - Iterates until C_total=0 or max_iter reached
+    Paper Section III step (3):
+    Fix backbone, re-run QAOA on conflicting subgraphs.
+    Isomorphic subgraphs reuse coloring via Eq.(5): c_{Gi}(v) = c_{Gj}(φ^{-1}(v)).
     """
-    # Backbone: map each node to its supernode color (mod k)
     backbone: Dict[int, int] = {
         n: inter_coloring[cid] % k
         for cid, nodes in communities.items()
         for n in nodes
     }
-
-    iso_cache: Dict[int, Tuple[nx.Graph, Dict[int, int]]] = {}  # Eq.(5) cache
+    iso_cache: Dict[int, Tuple[nx.Graph, Dict[int, int]]] = {}
 
     for iteration in range(max_iter):
-        # Build current global coloring to measure C_total
         global_col = _merge_simple(communities, sub_colorings, backbone)
         c_total = count_edge_conflicts(graph, global_col)
         print(f"      [Feedback iter {iteration}] edge conflicts = {c_total}")
@@ -551,7 +526,7 @@ def feedback_correction(graph: nx.Graph,
             if count_edge_conflicts(subgraph, col) == 0:
                 continue
 
-            # Eq.(5): check if isomorphic to a previously solved subgraph
+            # Eq.(5): isomorphism reuse
             reused = False
             for ref_cid, (ref_sub, ref_col) in iso_cache.items():
                 if (subgraph.number_of_nodes() == ref_sub.number_of_nodes()
@@ -560,7 +535,6 @@ def feedback_correction(graph: nx.Graph,
                     gm = nx.algorithms.isomorphism.GraphMatcher(subgraph, ref_sub)
                     mapping = next(gm.isomorphisms_iter(), None)
                     if mapping:
-                        # c_{Gi}(v) = c_{Gj}(φ^{-1}(v))   Eq.(5)
                         sub_colorings[cid] = {
                             v: ref_col[mapping[v]] % k for v in nodes
                         }
@@ -570,7 +544,6 @@ def feedback_correction(graph: nx.Graph,
             if reused:
                 continue
 
-            # Re-run QAOA with backbone as fixed constraints
             fixed = {n: backbone[n] for n in nodes}
             new_col = solve_k_coloring_qaoa(
                 subgraph, k, fixed, p, shots, Q_available,
@@ -586,7 +559,7 @@ def feedback_correction(graph: nx.Graph,
 def _merge_simple(communities: Dict[int, List[int]],
                   sub_colorings: Dict[int, Dict[int, int]],
                   backbone: Dict[int, int]) -> Dict[int, int]:
-    """Quick merge using sub_coloring with backbone fallback."""
+    """Quick merge: sub_coloring with backbone fallback."""
     col: Dict[int, int] = {}
     for cid, nodes in communities.items():
         sc = sub_colorings.get(cid, {})
@@ -604,13 +577,10 @@ def merge_colorings(communities: Dict[int, List[int]],
                     inter_coloring: Dict[int, int],
                     k: int) -> Dict[int, int]:
     """
-    Paper Section II-B Eq.(6):
-    α_i = base color of subgraph G_i in interaction graph
-    k_i = max internal color + 1
-
-    Color synthesis:
-      k_i > k:  c_merged(v) = (α_i + c_in(v)) mod k          (remapping)
-      k_i ≤ k:  c_merged(v) = (α_i·k_i + c_in(v)) mod (k·k_i) (combination)
+    Paper Eq.(6):
+    α_i = base color from interaction graph,  k_i = max internal color + 1.
+      k_i > k → c_merged(v) = (α_i + c_in(v)) mod k
+      k_i ≤ k → c_merged(v) = (α_i·k_i + c_in(v)) mod (k·k_i)
     """
     global_col: Dict[int, int] = {}
     for cid, nodes in communities.items():
@@ -621,9 +591,9 @@ def merge_colorings(communities: Dict[int, List[int]],
         for v in nodes:
             c_in = col.get(v, 0)
             if k_i > k:
-                global_col[v] = (alpha_i + c_in) % k                  # Eq.(6a)
+                global_col[v] = (alpha_i + c_in) % k
             else:
-                global_col[v] = (alpha_i * k_i + c_in) % (k * k_i)   # Eq.(6b)
+                global_col[v] = (alpha_i * k_i + c_in) % (k * k_i)
 
     return global_col
 
@@ -634,16 +604,11 @@ def resolve_conflicts_greedy(graph: nx.Graph,
                               k: int,
                               max_iter: int = 20) -> Dict[int, int]:
     """
-    Paper Section II-B Eq.(7) + Section III last paragraph:
-    "local greedy conflict-correction colouring"
-
-    M = k · max_i(k_i)   (color space modulus)
-    Δ(u) = 1 + ⌊c(u)/M⌋  (dynamic step size)
-    c_merged(u) = (c(u) + Δ(u)) mod M
+    Paper Eq.(7): local greedy conflict-correction.
+    M = k · max_i(k_i),  Δ(u) = 1 + ⌊c(u)/M⌋,  c(u) ← (c(u)+Δ(u)) mod M.
     """
     col = dict(coloring)
 
-    # Compute M
     k_i_vals = []
     for cid, nodes in communities.items():
         vals = [col[v] for v in nodes if v in col]
@@ -657,11 +622,10 @@ def resolve_conflicts_greedy(graph: nx.Graph,
             break
         print(f"      [Conflict resolution step {step}] "
               f"remaining conflicts = {len(conflicts)}")
-
         for u, v in conflicts:
             cu = col.get(u, 0)
-            delta = 1 + (cu // M) if M > 0 else 1    # Eq.(7)
-            col[u] = (cu + delta) % M                  # Eq.(7)
+            delta = 1 + (cu // M) if M > 0 else 1
+            col[u] = (cu + delta) % M
 
     return col
 
@@ -672,24 +636,18 @@ def resolve_conflicts_greedy(graph: nx.Graph,
 
 def quantum_graph_coloring(
     graph: nx.Graph,
-    k_max: int           = 4,     # maximum colors to try (sweeps k=2..k_max)
-    Q_available: int     = 20,    # qubit budget (NISQ; paper uses ~21)
-    p: int               = 2,     # QAOA circuit depth
-    shots: int           = 1024,
-    lambda_edge: float   = 2.0,   # paper: λ_edge = 2
-    feedback_iter: int   = 5,     # step (3) max feedback iterations
-    resolve_iter: int    = 20,    # step (4) max greedy correction steps
-    seed: int            = 42,
+    k_max: int          = 4,
+    Q_available: int    = 20,
+    p: int              = 2,
+    shots: int          = 1024,
+    lambda_edge: float  = 2.0,   # paper: λ_edge = 2
+    feedback_iter: int  = 5,
+    resolve_iter: int   = 20,
+    seed: int           = 42,
 ) -> Tuple[Dict[int, int], int, float]:
     """
     Full hierarchical hybrid variational quantum algorithm (Fig. 1).
-
-    Sweeps k from 2 to k_max (paper: "evaluate each k sequentially,
-    starting from 2").
-
-    Returns
-    -------
-    (global_coloring, colors_used, conflict_rate_ε)
+    Sweeps k from Brooks' bound down to 2; returns first valid coloring.
     """
     np.random.seed(seed)
     print(f"\n{'='*65}")
@@ -700,37 +658,33 @@ def quantum_graph_coloring(
     best_col: Dict[int, int] = {}
     best_k = k_max
     best_eps = 1.0
+
     start_k = min(k_max, get_brooks_bound(graph))
     for k in range(start_k, 1, -1):
         m = num_qubits_per_node(k)
-        # Paper: λ_fix = 1000·|S|  where |S| = total fixed nodes
         S_size = graph.number_of_nodes()
-        lambda_fix = 1000 * S_size
+        lambda_fix = 1000 * S_size   # paper: λ_fix = 1000·|S|
 
         print(f"\n{'─'*65}")
-        print(f"[k={k}]  m={m} qubits/node  λ_edge={lambda_edge}  "
-              f"λ_fix={lambda_fix}")
+        print(f"[k={k}]  m={m} qubits/node  λ_edge={lambda_edge}  λ_fix={lambda_fix}")
 
-        # ── (a) Louvain partitioning ──────────────────────────────────────────
+        # (a) Louvain partitioning
         communities = louvain_partition(graph, k, Q_available)
         print(f"\n  (a) Louvain → {len(communities)} subgraphs: "
               + ", ".join(f"S{c}({len(n)}n)" for c, n in communities.items()))
 
-        # ── (2) Interaction graph + greedy backbone ───────────────────────────
+        # (2) Interaction graph + greedy backbone
         ig, inter_coloring = build_interaction_graph(graph, communities)
         print(f"  (2) Interaction graph: {ig.number_of_nodes()} supernodes, "
               f"{ig.number_of_edges()} edges")
-        print(f"      Backbone colors: {inter_coloring}")
+        print(f"      Backbone: {inter_coloring}")
 
-        node_to_cid = {n: cid for cid, nodes in communities.items()
-                       for n in nodes}
-        backbone = {n: inter_coloring[node_to_cid[n]] % k
-                    for n in graph.nodes()}
+        node_to_cid = {n: cid for cid, nodes in communities.items() for n in nodes}
+        backbone = {n: inter_coloring[node_to_cid[n]] % k for n in graph.nodes()}
 
-        # ── (b) QAOA on each subgraph ─────────────────────────────────────────
+        # (b) QAOA on each subgraph
         sub_colorings: Dict[int, Dict[int, int]] = {}
         print(f"\n  (b) Subgraph QAOA:")
-
         for cid in sorted(communities.keys()):
             nodes = communities[cid]
             subgraph = graph.subgraph(nodes).copy()
@@ -746,13 +700,12 @@ def quantum_graph_coloring(
             )
             if col is None:
                 print("SKIPPED (exceeds qubit limit)")
-                col = fixed  # fallback to backbone
+                col = fixed
             else:
-                lc = count_edge_conflicts(subgraph, col)
-                print(f"local conflicts={lc}")
+                print(f"local conflicts={count_edge_conflicts(subgraph, col)}")
             sub_colorings[cid] = col
 
-        # ── (c) Feedback correction ───────────────────────────────────────────
+        # (c) Feedback correction
         print(f"\n  (c) Feedback correction:")
         sub_colorings = feedback_correction(
             graph, communities, sub_colorings, inter_coloring,
@@ -760,16 +713,14 @@ def quantum_graph_coloring(
             max_iter=feedback_iter
         )
 
-        # ── (d) Merge + resolve conflicts ─────────────────────────────────────
-        print(f"\n  (d) Merging colorings (Eq.6):")
-        global_col = merge_colorings(
-            communities, sub_colorings, inter_coloring, k
-        )
+        # (d) Merge + resolve conflicts
+        print(f"\n  (d) Merging (Eq.6):")
+        global_col = merge_colorings(communities, sub_colorings, inter_coloring, k)
         ec = count_edge_conflicts(graph, global_col)
         print(f"      Edge conflicts after merge: {ec}")
 
         if ec > 0:
-            print(f"      Greedy conflict resolution (Eq.7):")
+            print(f"      Greedy correction (Eq.7):")
             global_col = resolve_conflicts_greedy(
                 graph, global_col, communities, k, max_iter=resolve_iter
             )
@@ -787,57 +738,226 @@ def quantum_graph_coloring(
 
         if valid:
             print(f"\n{'='*65}")
-            print(f"✓  Valid {k}-coloring!  colors_used={k_used}  ε={best_eps:.4f}")
-            print(f"   Coloring: {global_col}")
+            print(f"✓ Valid {k}-coloring!  colors_used={k_used}  ε={eps:.4f}")
+            print(f"  Coloring: {global_col}")
             print('='*65)
             return global_col, k_used, eps
 
-    # Best-effort result if no valid coloring found
     print(f"\n{'='*65}")
-    print(f"[!] No fully valid coloring within k_max={k_max}.")
-    print(f"    Best result: colors_used={best_k}  ε={best_eps:.4f}")
+    print(f"[!] Best result: colors_used={best_k}  ε={best_eps:.4f}")
     print('='*65)
     return best_col, best_k, best_eps
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DEMO
+# WELL-DEFINED GRAPH CONSTRUCTORS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def make_cycle_graph() -> nx.Graph:
+    """
+    C_7: 7-node cycle graph.
+    Chromatic number χ = 3 (odd cycle).
+    Nodes: 0-1-2-3-4-5-6-0.
+    Edges: 7,  a classic NISQ-scale benchmark.
+    """
+    return nx.cycle_graph(7)
+
+
+def make_wheel_graph() -> nx.Graph:
+    """
+    W_8: Wheel graph with 8 spokes (9 nodes total: hub + 8-cycle rim).
+    Chromatic number χ = 4 (even cycle rim + hub).
+    Hub (node 0) is connected to every rim node.
+    """
+    return nx.wheel_graph(9)
+
+
+def make_petersen_graph() -> nx.Graph:
+    """
+    Petersen graph: 10 nodes, 15 edges.
+    Chromatic number χ = 3.
+    A well-known 3-regular graph, widely used in graph theory benchmarks.
+    Nodes: 0–9. Outer pentagon: 0-1-2-3-4; inner pentagram: 5-7-9-6-8-5;
+    spokes: 0-5, 1-6, 2-7, 3-8, 4-9.
+    """
+    return nx.petersen_graph()
+
+
+def make_bipartite_k33() -> nx.Graph:
+    """
+    Complete bipartite graph K_{3,3}: 6 nodes, 9 edges.
+    Chromatic number χ = 2 (bipartite).
+    Left partition: {0,1,2}, right partition: {3,4,5}.
+    Every left node is connected to every right node.
+    """
+    return nx.complete_bipartite_graph(3, 3)
+
+
+def make_grotzsch_graph() -> nx.Graph:
+    """
+    Grötzsch graph: 11 nodes, 20 edges.
+    Chromatic number χ = 4.
+    The smallest triangle-free graph that requires 4 colors.
+    A classic hard instance for graph coloring algorithms.
+    """
+    return nx.grotzsch_graph()
+
+
+def make_crown_graph() -> nx.Graph:
+    """
+    Crown graph S_8^0 (complete bipartite K_{4,4} minus a perfect matching):
+    8 nodes, 12 edges.
+    Chromatic number χ = 2 (bipartite).
+    Nodes split into two groups of 4; each node in group A is connected to
+    every node in group B except its direct pair.
+    """
+    G = nx.Graph()
+    n = 4
+    # Group A: 0..n-1, Group B: n..2n-1
+    for i in range(n):
+        for j in range(n, 2 * n):
+            if j - n != i:          # skip the perfect-matching pair
+                G.add_edge(i, j)
+    return G
+
+
+def make_bull_graph() -> nx.Graph:
+    """
+    Bull graph: 5 nodes, 5 edges.
+    Chromatic number χ = 3.
+    Looks like a triangle with two pendant edges forming "horns".
+    Edges: (0,1),(1,2),(2,0),(0,3),(1,4).
+    """
+    G = nx.Graph()
+    G.add_edges_from([(0, 1), (1, 2), (2, 0), (0, 3), (1, 4)])
+    return G
+
+
+def make_manual_10node_graph() -> nx.Graph:
+    """
+    Manually defined 10-node graph.
+    Chromatic number χ = 3.
+
+    Node layout (conceptual):
+      Outer ring  : 0 - 1 - 2 - 3 - 4 - 0   (pentagon)
+      Inner ring  : 5 - 6 - 7 - 8 - 9 - 5   (pentagon)
+      Cross edges : 0-5, 1-7, 2-9, 3-6, 4-8  (irregular spokes)
+      Extra chords: 0-2, 5-8                  (make it non-trivially 3-chromatic)
+
+    This gives 17 edges total and is NOT the Petersen graph —
+    the cross-spoke pattern and extra chords create asymmetric
+    neighborhoods that exercise the Louvain partition differently.
+    """
+    G = nx.Graph()
+    G.add_nodes_from(range(10))
+
+    # Outer pentagon
+    G.add_edges_from([(0, 1), (1, 2), (2, 3), (3, 4), (4, 0)])
+
+    # Inner pentagon
+    G.add_edges_from([(5, 6), (6, 7), (7, 8), (8, 9), (9, 5)])
+
+    # Irregular spokes (cross edges between rings)
+    G.add_edges_from([(0, 5), (1, 7), (2, 9), (3, 6), (4, 8)])
+
+    # Extra chords to raise the chromatic complexity
+    G.add_edges_from([(0, 2), (5, 8)])
+
+    return G
+
+
+def make_dodecahedron_graph() -> nx.Graph:
+    """
+    Dodecahedron graph: 20 nodes, 30 edges.
+    Chromatic number χ = 3.
+    The graph of a regular dodecahedron; 3-regular and planar.
+    A medium-scale benchmark fitting within Q=21 with binary encoding.
+    """
+    return nx.dodecahedron_graph()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN — WELL-DEFINED GRAPH BENCHMARKS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
 
+    # Each entry: (display_name, graph, k_max, Q_available, p, shots, known_χ)
+    benchmarks = [
+        # ── Small graphs (χ known exactly) ───────────────────────────────────
+        (
+            "Bull graph (χ=3)",
+            make_bull_graph(),
+            3, 20, 1, 512, 3,
+        ),
+        (
+            "K_{3,3} bipartite (χ=2)",
+            make_bipartite_k33(),
+            3, 20, 1, 512, 2,
+        ),
+        (
+            "C_7 odd cycle (χ=3)",
+            make_cycle_graph(),
+            3, 20, 2, 512, 3,
+        ),
+        # ── Medium graphs ─────────────────────────────────────────────────────
+        (
+            "Petersen graph (χ=3)",
+            make_petersen_graph(),
+            4, 20, 2, 512, 3,
+        ),
+        (
+            "Crown S_8^0 (χ=2)",
+            make_crown_graph(),
+            3, 20, 2, 512, 2,
+        ),
+        (
+            "Wheel W_8 (χ=4)",
+            make_wheel_graph(),
+            4, 20, 2, 512, 4,
+        ),
+        # ── Manually defined graph ───────────────────────────────────────────
+        (
+            "Manual 10-node graph (χ=3)",
+            make_manual_10node_graph(),
+            3, 20, 2, 512, 3,
+        ),
+        # ── Larger / harder graphs ────────────────────────────────────────────
+        
+    ]
+
     results = []
 
-    # ── Example 1: 10-node, 12-edge (matches paper dataset) ──────────────────
-    print("\n>>> Example 1: 10-node, 12-edge random graph (paper dataset style)")
-    G1 = nx.gnm_random_graph(10, 12, seed=0)
-    col1, k1, eps1 = quantum_graph_coloring(
-        G1, k_max=4, Q_available=20, p=1, shots=512, seed=0
-    )
-    results.append(("10n-12e", G1, col1, k1, eps1))
+    for name, G, k_max, Q, p, shots, chi_known in benchmarks:
+        print(f"\n\n{'#'*65}")
+        print(f"# {name}")
+        print(f"# Nodes={G.number_of_nodes()}  Edges={G.number_of_edges()}  "
+              f"Known χ={chi_known}")
+        print(f"{'#'*65}")
 
-    # ── Example 2: 10-node, 16-edge ───────────────────────────────────────────
-    print("\n>>> Example 2: 10-node, 16-edge random graph")
-    G2 = nx.gnm_random_graph(10, 16, seed=0)
-    col2, k2, eps2 = quantum_graph_coloring(
-        G2, k_max=4, Q_available=20, p=2, shots=512, seed=0
-    )
-    results.append(("10n-16e", G2, col2, k2, eps2))
+        col, k_used, eps = quantum_graph_coloring(
+            G,
+            k_max=k_max,
+            Q_available=Q,
+            p=p,
+            shots=shots,
+            lambda_edge=2.0,
+            feedback_iter=5,
+            resolve_iter=20,
+            seed=42,
+        )
+        results.append((name, G, col, k_used, eps, chi_known))
 
-    # ── Example 3: 20-node, 20-edge (paper dataset) ───────────────────────────
-    print("\n>>> Example 3: 20-node, 20-edge random graph")
-    G3 = nx.gnm_random_graph(20, 20, seed=0)
-    col3, k3, eps3 = quantum_graph_coloring(
-        G3, k_max=5, Q_available=21, p=2, shots=512, seed=0
-    )
-    results.append(("20n-20e", G3, col3, k3, eps3))
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print("\n" + "="*65)
-    print(f"{'Graph':<12} {'N':>4} {'E':>4} {'k_used':>6} {'ε':>7}  {'Valid'}")
-    print("="*65)
-    for name, G, col, k, eps in results:
+    # ── Final Summary Table ───────────────────────────────────────────────────
+    print("\n\n" + "=" * 75)
+    print(f"{'Graph':<35} {'N':>4} {'E':>4} {'χ_known':>7} "
+          f"{'k_used':>6} {'ε':>7}  {'Valid'}")
+    print("=" * 75)
+    for name, G, col, k_used, eps, chi_known in results:
         v = is_valid(G, col)
-        print(f"{name:<12} {G.number_of_nodes():>4} {G.number_of_edges():>4} "
-              f"{k:>6} {eps:>7.4f}  {v}")
-    print("="*65)
+        optimal = "✓ optimal" if k_used == chi_known else (
+            "✗ over" if k_used > chi_known else "✗ under"
+        )
+        print(f"{name:<35} {G.number_of_nodes():>4} {G.number_of_edges():>4} "
+              f"{chi_known:>7} {k_used:>6} {eps:>7.4f}  {v}  {optimal}")
+    print("=" * 75)
