@@ -54,6 +54,12 @@ warnings.filterwarnings("ignore")
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION II-A  Color coding
 # ═══════════════════════════════════════════════════════════════════════════════
+def get_brooks_bound(subgraph: nx.Graph) -> int:
+    """Brooks' Theorem: k <= Δ + 1"""
+    if subgraph.number_of_nodes() == 0: return 2
+    delta = max(dict(subgraph.degree()).values())
+    # Standard Brooks bound logic
+    return delta + 1
 
 def num_qubits_per_node(k: int) -> int:
     """
@@ -694,8 +700,8 @@ def quantum_graph_coloring(
     best_col: Dict[int, int] = {}
     best_k = k_max
     best_eps = 1.0
-
-    for k in range(2, k_max + 1):
+    start_k = min(k_max, get_brooks_bound(graph))
+    for k in range(start_k, 1, -1):
         m = num_qubits_per_node(k)
         # Paper: λ_fix = 1000·|S|  where |S| = total fixed nodes
         S_size = graph.number_of_nodes()
