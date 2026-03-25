@@ -67,40 +67,244 @@ def expectation(counts: Dict, h: H, nq: int) -> float:             # Eq.(13)
         te += p*e; tp += p
     return te / max(tp, 1e-12)
 
-# ── QAOA circuit  Fig.2 ───────────────────────────────────────────────────────
-def qaoa_circuit(h: H, nq: int, p: int) -> QuantumCircuit:
+# ══════════════════════════════════════════════════════════════════════════════
+# QAOA CIRCUITS
+# Two modes that can be selected per subgraph call:
+#
+#   "binary"  — paper's original binary encoding (m = ⌈log2 k⌉ qubits/node)
+#               Standard H⊗n initial state; standard RX mixer.
+#
+#   "onehot"  — Symmetry-Protected State Preparation (Direction C)
+#               k qubits per node; initial state = |W⟩ per node (exactly one
+#               "1" bit), so the Hilbert space is restricted to valid colorings
+#               from the start.  Mixer preserves the W-state subspace via
+#               partial-SWAP (fSWAP-style) rotations between color qubits of
+#               the same node.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Binary QAOA circuit  (paper Fig.2, original) ──────────────────────────────
+def qaoa_circuit_binary(h: H, nq: int, p: int) -> QuantumCircuit:
+    """
+    Standard QAOA ansatz from paper Fig.2.
+    Initial state: |+⟩^⊗n  (all 2^n bitstrings in superposition).
+    Mixer: RX(2β) on every qubit.
+    """
     γ, β = ParameterVector("γ", p), ParameterVector("β", p)
-    qc = QuantumCircuit(nq); qc.h(range(nq))
+    qc = QuantumCircuit(nq); qc.h(range(nq))           # |+⟩^⊗n
     for l in range(p):
         for c, q in h.s:
             qc.rz(2*γ[l]*c, q)
         for c, i, j in h.d:
             qc.cx(i, j); qc.rz(2*γ[l]*c, j); qc.cx(i, j)
-        qc.rx(2*β[l], range(nq))
+        qc.rx(2*β[l], range(nq))                       # standard mixer
     qc.measure_all()
     return qc
 
-def decode_col(counts, nq, nodes, m, k):
+
+# ── One-Hot Hamiltonian  (k qubits per node, Eq.10/11 in one-hot encoding) ───
+def build_H_onehot(G: nx.Graph, k: int, fixed: Dict, le: float, lf: float):
+    """
+    One-hot encoding: node v uses k qubits q(v,c) = v_idx*k + c.
+    qubit q(v,c) = 1  ↔  node v is assigned color c.
+
+    H_edge (Eq.10 adapted):
+      Penalty when adjacent nodes u,v share color c:
+        Σ_{(u,v)∈E} Σ_c  q(u,c)·q(v,c)
+      In Ising (Z) form:  ¼(1-Z_{u,c})(1-Z_{v,c})
+        = ¼ - ¼Z_{u,c} - ¼Z_{v,c} + ¼Z_{u,c}Z_{v,c}
+
+    H_fix (Eq.11 adapted):
+      For fixed node v with color t:
+        Penalise q(v,c)=1 for all c ≠ t  →  energy += (1-Z_{v,c})/2  for c≠t
+        Reward   q(v,t)=1               →  energy -= (1-Z_{v,t})/2
+
+    Returns (H, n_qubits, nodes).
+    """
+    nodes = list(G.nodes()); idx = {v: i for i, v in enumerate(nodes)}
+    nq = len(nodes) * k; h = H()
+
+    # H_edge
+    for u, v in G.edges():
+        iu, iv = idx[u], idx[v]
+        for c in range(k):
+            qu, qv = iu*k + c, iv*k + c
+            # ¼(I - Z_u - Z_v + ZZ)  scaled by λ_edge
+            h.c  += le * 0.25
+            h.s.append((-le * 0.25, qu))
+            h.s.append((-le * 0.25, qv))
+            h.d.append(( le * 0.25, qu, qv))
+
+    # H_fix
+    for v, tc in fixed.items():
+        if v not in idx: continue
+        iv = idx[v]
+        for c in range(k):
+            q = iv*k + c
+            if c != tc:
+                # penalise wrong color: (1-Z)/2 → constant +½, single -½
+                h.c += lf * 0.5
+                h.s.append((-lf * 0.5, q))
+            else:
+                # reward correct color: -(1-Z)/2 → constant -½, single +½
+                h.c -= lf * 0.5
+                h.s.append(( lf * 0.5, q))
+
+    return h, nq, nodes
+
+
+# ── One-Hot QAOA circuit  (Symmetry-Protected State Preparation) ─────────────
+def _w_state(qc: QuantumCircuit, qubits: List[int]) -> None:
+    """
+    Prepare the W-state |W_k⟩ = (1/√k)(|100…0⟩ + |010…0⟩ + … + |00…01⟩)
+    on `qubits` using the cascade construction:
+      RY(2·arccos(1/√j)) on qubit j conditioned on qubit j-1 = |1⟩,
+    then CNOT chain to transfer the excitation.
+
+    |W_k⟩ has exactly one "1", so it lives entirely in the valid one-hot
+    subspace — no invalid states are ever created.
+    """
+    k = len(qubits)
+    if k == 0: return
+    qc.x(qubits[0])                        # |100…0⟩  (seed excitation)
+    for j in range(1, k):
+        # rotate fraction of amplitude forward: RY(2·arccos(√(1/(k-j+1))))
+        theta = 2 * math.acos(math.sqrt(1.0 / (k - j + 1)))
+        qc.ry(theta, qubits[j])
+        qc.cx(qubits[j], qubits[j-1])      # controlled transfer
+        qc.cx(qubits[j-1], qubits[j])
+
+
+def _onehot_mixer_layer(qc: QuantumCircuit, nodes_range: range,
+                         k: int, beta_param) -> None:
+    """
+    Symmetry-preserving mixer for one-hot encoding.
+
+    For each node block (k qubits), apply partial-SWAP rotations between
+    every pair of color qubits (c_a, c_b):
+        Rxx(β)·Ryy(β)
+    This swaps amplitude between |…1…0…⟩ and |…0…1…⟩ within the block,
+    keeping the total excitation count = 1 (W-state subspace invariant).
+
+    The Rxx·Ryy gate decomposes to:
+        CX(a,b) · RX(2β, b) · CX(a,b)   (partial-iSWAP equivalent for ±1 sector)
+    which is native-gate friendly.
+    """
+    for v_idx in nodes_range:
+        base = v_idx * k
+        for c_a in range(k):
+            for c_b in range(c_a + 1, k):
+                qa, qb = base + c_a, base + c_b
+                # Rxx(β)·Ryy(β) ≈ partial-SWAP preserving one-hot subspace
+                qc.cx(qa, qb)
+                qc.rx(2 * beta_param, qb)
+                qc.cx(qa, qb)
+
+
+def qaoa_circuit_onehot(h: H, nq: int, n_nodes: int, k: int, p: int) -> QuantumCircuit:
+    """
+    Symmetry-Protected QAOA circuit.
+
+    Initial state: ⊗_{v} |W_k⟩_v
+      Each node's k qubits start in the W-state → exactly 1 color active.
+      Valid coloring subspace is respected from qubit 0.
+
+    Mixer: partial-SWAP rotations within each node's color block.
+      Preserves the constraint Σ_c x_{v,c} = 1 for all v throughout evolution.
+
+    Cost unitary U_C(γ): identical RZ/CX structure as binary mode.
+    """
+    γ, β = ParameterVector("γ", p), ParameterVector("β", p)
+    qc = QuantumCircuit(nq)
+
+    # ── Initial state: W-state per node ──────────────────────────────────────
+    for v_idx in range(n_nodes):
+        _w_state(qc, list(range(v_idx*k, v_idx*k + k)))
+
+    # ── p QAOA layers ─────────────────────────────────────────────────────────
+    for l in range(p):
+        # U_C(γ_l): cost unitary — same ZZ/Z structure as binary
+        for c, q in h.s:
+            qc.rz(2*γ[l]*c, q)
+        for c, i, j in h.d:
+            qc.cx(i, j); qc.rz(2*γ[l]*c, j); qc.cx(i, j)
+
+        # U_B(β_l): symmetry-preserving mixer
+        _onehot_mixer_layer(qc, range(n_nodes), k, β[l])
+
+    qc.measure_all()
+    return qc
+
+
+def decode_col_onehot(counts, nq, nodes, k):
+    """
+    Decode one-hot measurement: for each node block of k bits,
+    the active qubit index is the color.  If the block is invalid
+    (0 or >1 active), fall back to the highest-probability bit.
+    """
+    if not counts: return {}
+    best_state = max(counts, key=counts.get)
+    bits = [(best_state >> q) & 1 for q in range(nq)]
+    col = {}
+    for vi, v in enumerate(nodes):
+        block = bits[vi*k: vi*k + k]
+        ones = [c for c, b in enumerate(block) if b == 1]
+        col[v] = ones[0] if len(ones) == 1 else (block.index(max(block)) if any(block) else 0)
+    return col
+
+
+def decode_col_binary(counts, nq, nodes, m, k):
+    """Decode binary-encoded measurement (paper Table I step e)."""
     if not counts: return {}
     s = max(counts, key=counts.get)
     bits = [(s >> q) & 1 for q in range(nq)]
     return {v: dec(bits[i*m:(i+1)*m], k) for i, v in enumerate(nodes)}
 
-# ── Table I: solve_k_coloring  (multi-restart for better solutions) ───────────
-def solve_qaoa(G: nx.Graph, k: int, fixed: Dict, p: int, shots: int,
-               Q: int, le: float, lf: float, restarts: int = 3) -> Optional[Dict]:
-    """
-    Paper Table I with multi-restart (paper Sec.IV-A: algorithm re-run with
-    different initial parameters to improve solution quality).
-    """
-    nodes = list(G.nodes()); m = nqpn(k)
-    if not nodes or len(nodes)*m > Q: return None
-    h, nq, ordered = build_H(G, k, fixed, le, lf)
-    qc = qaoa_circuit(h, nq, p)
-    sampler = Sampler()
 
+# ── Unified solve_qaoa  (selects mode per subgraph) ──────────────────────────
+def solve_qaoa(G: nx.Graph, k: int, fixed: Dict, p: int, shots: int,
+               Q: int, le: float, lf: float,
+               restarts: int = 3, mode: str = "onehot") -> Optional[Dict]:
+    """
+    Paper Table I — unified solver supporting two circuit modes:
+
+      mode="binary"  — paper's original binary encoding
+      mode="onehot"  — Symmetry-Protected State Preparation (Direction C)
+                       Uses k qubits/node with W-state init + symmetry mixer.
+                       Falls back to binary if one-hot exceeds qubit budget Q.
+
+    Multi-restart: paper Sec.IV-A states the algorithm is "executed multiple
+    times to effectively train for a near-optimal solution."
+    Top-20 bitstring scan: exploits full measurement distribution (Table I e).
+    """
+    nodes = list(G.nodes())
+    if not nodes: return {}
+
+    # Qubit budget check — choose encoding that fits
+    nq_binary = len(nodes) * nqpn(k)
+    nq_onehot = len(nodes) * k
+    if mode == "onehot" and nq_onehot <= Q:
+        use_onehot = True
+    elif nq_binary <= Q:
+        use_onehot = False
+    else:
+        return None   # neither encoding fits
+
+    if use_onehot:
+        h, nq, ordered = build_H_onehot(G, k, fixed, le, lf)
+        qc = qaoa_circuit_onehot(h, nq, len(nodes), k, p)
+        _decode = lambda counts, nq, ordered, m, k: decode_col_onehot(counts, nq, ordered, k)
+        enc_label = "one-hot"
+    else:
+        m = nqpn(k)
+        h, nq, ordered = build_H(G, k, fixed, le, lf)
+        qc = qaoa_circuit_binary(h, nq, p)
+        _decode = decode_col_binary
+        enc_label = "binary"
+
+    m = nqpn(k)   # used in binary decode; harmless for one-hot
+    sampler = Sampler()
     best_col_global = None
-    best_ec_global = float("inf")
+    best_ec_global  = float("inf")
 
     for restart in range(restarts):
         θ = np.random.uniform(0, np.pi, 2*p)
@@ -109,14 +313,11 @@ def solve_qaoa(G: nx.Graph, k: int, fixed: Dict, p: int, shots: int,
         def obj(th):
             pd = {f"γ[{i}]": th[i] for i in range(p)}
             pd |= {f"β[{i}]": th[p+i] for i in range(p)}
-            res = sampler.run([qc.assign_parameters(pd)], shots=shots).result()
+            res  = sampler.run([qc.assign_parameters(pd)], shots=shots).result()
             loss = expectation(res.quasi_dists[0], h, nq)
-            col_tmp = decode_col(res.quasi_dists[0], nq, ordered, m, k)
-            if loss < bl - 1e-4:
-                best[:] = th; streak[0] = 0
-            else:
-                streak[0] += 1
-            # Paper Table I: early stop if 0 conflicts or no improvement in 3 steps
+            col_tmp = _decode(res.quasi_dists[0], nq, ordered, m, k)
+            if loss < bl - 1e-4: best[:] = th; streak[0] = 0
+            else: streak[0] += 1
             if streak[0] >= 3 or edge_conflicts(G, col_tmp) == 0:
                 best[:] = th; raise StopIteration
             return loss
@@ -130,16 +331,20 @@ def solve_qaoa(G: nx.Graph, k: int, fixed: Dict, p: int, shots: int,
 
         pd = {f"γ[{i}]": best[i] for i in range(p)}
         pd |= {f"β[{i}]": best[p+i] for i in range(p)}
-        # Paper: sample more shots at optimal θ* for better statistics
         fc = sampler.run([qc.assign_parameters(pd)], shots=shots*4).result().quasi_dists[0]
 
-        # Paper Table I (e): pick best among ALL sampled bitstrings, not just max-prob
-        # This exploits the full measurement distribution for a better solution
-        candidate_col = None
-        candidate_ec = float("inf")
-        for state_int, prob in sorted(fc.items(), key=lambda x: -x[1])[:20]:
+        # Top-20 bitstring scan for best candidate (Table I step e)
+        candidate_col, candidate_ec = None, float("inf")
+        for state_int, _ in sorted(fc.items(), key=lambda x: -x[1])[:20]:
             bits = [(state_int >> q) & 1 for q in range(nq)]
-            trial = {v: dec(bits[i*m:(i+1)*m], k) for i, v in enumerate(ordered)}
+            if use_onehot:
+                trial = {}
+                for vi, v in enumerate(ordered):
+                    block = bits[vi*k: vi*k + k]
+                    ones = [c for c, b in enumerate(block) if b == 1]
+                    trial[v] = ones[0] if len(ones) == 1 else (block.index(max(block)) if any(block) else 0)
+            else:
+                trial = {v: dec(bits[i*m:(i+1)*m], k) for i, v in enumerate(ordered)}
             ec = edge_conflicts(G, trial)
             if ec < candidate_ec:
                 candidate_col = trial; candidate_ec = ec
@@ -147,10 +352,11 @@ def solve_qaoa(G: nx.Graph, k: int, fixed: Dict, p: int, shots: int,
 
         if candidate_ec < best_ec_global:
             best_col_global = candidate_col
-            best_ec_global = candidate_ec
-            if best_ec_global == 0:
-                break  # perfect solution found, no need for more restarts
+            best_ec_global  = candidate_ec
+            if best_ec_global == 0: break
 
+    if best_col_global is not None:
+        print(f"[{enc_label}]", end=" ")
     return best_col_global
 
 # ── Louvain partition  Sec.III(a) ─────────────────────────────────────────────
@@ -208,7 +414,7 @@ def feedback(G: nx.Graph, comms: Dict, subs: Dict, inter: Dict,
                         reused = True; break
             if reused: continue
             nc = solve_qaoa(sg, k, {n: backbone[n] for n in nodes},
-                            p, shots, Q, le, lf)
+                            p, shots, Q, le, lf, mode="onehot")
             if nc: subs[cid] = nc; iso_cache[cid] = (sg.copy(), nc)
     return subs
 
