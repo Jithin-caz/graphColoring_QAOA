@@ -10,6 +10,12 @@ authors:
 - family-names: "Jimmy"
   given-names: "Colin"
   orcid: "https://orcid.org/0009-0008-4414-4715"
+- family-names: "Kumar"
+  given-names: "Mithilesh"
+  orcid: "https://orcid.org/0009-0005-0450-1843"
+- family-names: "Issac"
+  given-names: "Elizabeth"
+  orcid: "https://orcid.org/........."
 title: "Efficient Hybrid Variational Quantum Algorithm for Graph Coloring"
 version: 1.0.0
 doi: 10.5281/zenodo.20093393
