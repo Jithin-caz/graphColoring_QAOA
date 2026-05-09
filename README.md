@@ -1,5 +1,5 @@
 # Efficient Hybrid Variational Quantum Algorithm for Graph Coloring
-[![DOI](https://zenodo.org/badge/1186944955.svg)](https://doi.org/10.5281/zenodo.20093393)
+[![DOI](https://zenodo.org/badge/1186944955.svg)](https://doi.org/10.5281/zenodo.20093392)
 
 A faithful Python implementation of the quantum graph coloring algorithm from:
 
