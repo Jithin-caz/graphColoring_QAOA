@@ -1,13 +1,17 @@
-
+cff-version: 1.0.0
+message: "If you use this software, please cite it as below."
 authors:
-  - first-name: "Jithin"
-    last-names: "Reji"
-    orcid: "https://orcid.org/0009-0008-0061-9600"
-
-  - first-name: "Amal"
-    last-name: "Joseph"
-    orcid: "https://orcid.org/0009-0009-3417-4432"
-
-  - first-name: "Colin"
-    last-name: "Jimmy"
-    orcid: ""
+- family-names: "Reji"
+  given-names: "Jithin"
+  orcid: "https://orcid.org/0009-0008-0061-9600"
+- family-names: "Joseph"
+  given-names: "Amal"
+  orcid: "https://orcid.org/0009-0009-3417-4432"
+- family-names: "Jimmy"
+  given-names: "Colin"
+  orcid: "https://orcid.org/0000-0000-0000-0000"
+title: "Hierarchical Hybrid Quantum Framework for Scalable Graph Coloring in NISQ Devices"
+version: 1.0.0
+doi: 10.5281/zenodo.20093393
+date-released: 2026-09-05
+url: "https://github.com/Jithin-caz/graphColoring_QAOA"
